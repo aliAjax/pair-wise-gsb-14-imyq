@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "sim": "esbuild src/price/sim.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/sim.mjs && node node_modules/.cache/sim.mjs"
   },
   "dependencies": {
     "@vitejs/plugin-vue": "^6.0.1",

@@ -1,193 +1,127 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
+import { EDITABLE_KEYS, FIELD_LABELS, fields, project } from "./config";
+import { usePriceStore, type EditBaseline } from "./store";
+import type { FieldValue, PendingRevision, PriceRecord } from "./types";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const store = usePriceStore();
+store.init();
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+type FormState = Record<string, string | number>;
 
-const project = {
-  "number": 9,
-  "folder": "dfwl/frontend/dfwlfront-9",
-  "framework": "vue",
-  "title": "油品价格维护",
-  "subtitle": "维护挂牌价、记录更新时间，并支持恢复默认价格。",
-  "industry": "石油",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Pinia",
-    "Naive UI"
-  ],
-  "storageKey": "dfwlfront-9-price",
-  "formTitle": "调整油品价格",
-  "primaryAction": "保存价格",
-  "entityLabel": "油品",
-  "statuses": [
-    "生效中",
-    "待确认",
-    "已回退"
-  ],
-  "filters": [
-    "全部油品",
-    "92号汽油",
-    "95号汽油",
-    "98号汽油",
-    "柴油"
-  ],
-  "fields": [
-    {
-      "key": "fuel",
-      "label": "油品",
-      "type": "select",
-      "options": [
-        "92号汽油",
-        "95号汽油",
-        "98号汽油",
-        "柴油"
-      ]
-    },
-    {
-      "key": "price",
-      "label": "挂牌价",
-      "type": "number"
-    },
-    {
-      "key": "operator",
-      "label": "操作员"
-    },
-    {
-      "key": "effectiveDate",
-      "label": "生效日期",
-      "type": "date"
-    }
-  ],
-  "records": [
-    {
-      "fuel": "92号汽油",
-      "price": 7.62,
-      "operator": "站长",
-      "effectiveDate": "2026-06-30",
-      "status": "生效中",
-      "notes": "正常调价"
-    },
-    {
-      "fuel": "柴油",
-      "price": 7.18,
-      "operator": "值班经理",
-      "effectiveDate": "2026-06-30",
-      "status": "待确认",
-      "notes": "等待复核"
-    }
-  ],
-  "metricLabels": [
-    "油品数",
-    "待确认",
-    "平均挂牌价"
-  ]
-} as const;
-
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
+function createBlank(): FormState {
+  return Object.fromEntries([
+    ...fields.map((field) => [field.key, field.type === "number" ? "" : ""]),
+    ["notes", ""]
+  ]);
 }
 
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
-}
-
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
+const form = reactive<FormState>(createBlank());
 const filter = ref(project.filters[0]);
+const confirmer = ref("值班经理");
+/** 当前编辑上下文：打开表单那一刻的记录版本与字段值（基线） */
+const editing = ref<EditBaseline | null>(null);
+/** 每个修订里冲突字段的取舍：mine=采用提交值，current=保留当前值 */
+const choices = reactive<Record<string, Record<string, "mine" | "current">>>({});
+
+const records = computed(() => store.records);
+const revisions = computed(() => store.pendingRevisions);
 
 const filteredRecords = computed(() => {
   if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
+  return records.value.filter((record) => record.fuel === filter.value);
 });
 
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
+const metrics = computed(() => [
+  records.value.length,
+  revisions.value.length,
+  store.averageActivePrice
+]);
+
+const maxChart = computed(() => Math.max(1, ...store.chartRows.map((row) => row.value)));
+
+const editingRecord = computed(() =>
+  editing.value ? records.value.find((record) => record.id === editing.value?.recordId) : undefined
+);
+
+/** 基线已过期：打开表单后另一窗口保存了新版本 */
+const isStale = computed(
+  () => Boolean(editing.value && editingRecord.value && editingRecord.value.version !== editing.value?.baseVersion)
+);
+
+function pickBaseline(record: PriceRecord): Record<string, FieldValue> {
+  return Object.fromEntries(
+    EDITABLE_KEYS.map((key) => [key, record[key as keyof PriceRecord] as FieldValue])
   );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
-
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
-
-const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
-
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
 }
 
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
+function startEdit(record: PriceRecord) {
+  editing.value = {
+    recordId: record.id,
+    baseVersion: record.version,
+    baseValues: pickBaseline(record)
+  };
+  Object.assign(form, pickBaseline(record));
 }
 
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
+function cancelEdit() {
+  editing.value = null;
+  Object.assign(form, createBlank());
 }
 
 function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
+  if (editing.value) {
+    // 写失败时保留表单内容，用户可直接重试
+    if (store.submitEdit(editing.value, { ...form }, String(form.operator ?? ""))) cancelEdit();
+  } else if (store.submitNew({ ...form })) {
+    Object.assign(form, createBlank());
+  }
 }
 
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
+function fieldLabel(key: string) {
+  return FIELD_LABELS[key] ?? key;
 }
 
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
+function recordOf(revision: PendingRevision) {
+  return records.value.find((record) => record.id === revision.recordId);
+}
+
+function conflictsOf(revision: PendingRevision) {
+  return store.revisionConflicts.get(revision.id) ?? [];
+}
+
+function currentValue(revision: PendingRevision, key: string): FieldValue {
+  const record = recordOf(revision);
+  if (!record) return "—";
+  return record[key as keyof PriceRecord] as FieldValue;
+}
+
+function getChoice(revisionId: string, key: string): "mine" | "current" {
+  return choices[revisionId]?.[key] ?? "current";
+}
+
+function setChoice(revisionId: string, key: string, value: "mine" | "current") {
+  if (!choices[revisionId]) choices[revisionId] = {};
+  choices[revisionId][key] = value;
+}
+
+function confirm(revision: PendingRevision) {
+  store.confirmRevision(revision.id, choices[revision.id] ?? {}, confirmer.value);
+  delete choices[revision.id];
+}
+
+function formatTime(iso: string | null | undefined) {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function primaryText(record: PriceRecord) {
+  return `${record.fuel} / ${record.price}`;
+}
+
+function copySummary(record: PriceRecord) {
+  void window.navigator.clipboard?.writeText(primaryText(record));
 }
 </script>
 
@@ -205,6 +139,13 @@ function remove(id: string) {
         </div>
       </header>
 
+      <div v-if="store.notices.length" class="notices">
+        <div v-for="notice in store.notices" :key="notice.id" class="notice" :class="notice.kind">
+          <span>{{ notice.text }}</span>
+          <button type="button" class="notice-close" @click="store.dismissNotice(notice.id)">×</button>
+        </div>
+      </div>
+
       <section class="metrics">
         <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
           <span>{{ label }}</span>
@@ -214,7 +155,20 @@ function remove(id: string) {
 
       <section class="workspace">
         <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
+          <h2>{{ editing ? `编辑：${editingRecord?.fuel ?? "已删除记录"}` : project.formTitle }}</h2>
+
+          <p v-if="editing" class="baseline">
+            打开时基线版本 v{{ editing.baseVersion }}
+            <template v-if="editingRecord"> · 当前 v{{ editingRecord.version }}</template>
+          </p>
+          <p v-if="editing && !editingRecord" class="stale-warning">
+            该记录已被另一窗口删除，提交将不会生效。
+          </p>
+          <p v-else-if="isStale" class="stale-warning">
+            另一窗口已保存新版本（v{{ editingRecord?.version }}）。继续提交不会覆盖对方修改，
+            将转入待处理修订，由值班经理确认后生效。
+          </p>
+
           <div class="form-grid">
             <label v-for="field in fields" :key="field.key">
               {{ field.label }}
@@ -222,17 +176,99 @@ function remove(id: string) {
                 <option value="">请选择</option>
                 <option v-for="option in field.options" :key="option">{{ option }}</option>
               </select>
+              <input
+                v-else-if="field.type === 'number'"
+                v-model="form[field.key]"
+                type="number"
+                step="0.01"
+                min="0"
+                required
+              />
               <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
             </label>
             <label>
               备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
+              <textarea v-model="form.notes" placeholder="填写处理说明或现场备注" />
             </label>
-            <button type="submit">{{ project.primaryAction }}</button>
+            <div class="form-actions">
+              <button type="submit">{{ editing ? "提交修改" : project.primaryAction }}</button>
+              <button v-if="editing" type="button" class="secondary" @click="cancelEdit">取消编辑</button>
+            </div>
           </div>
         </form>
 
         <section class="list-panel">
+          <div v-if="revisions.length" class="revisions">
+            <div class="toolbar">
+              <h2>待处理修订（{{ revisions.length }}）</h2>
+              <label class="confirmer">
+                确认人
+                <input v-model="confirmer" placeholder="值班经理" />
+              </label>
+            </div>
+
+            <article v-for="revision in revisions" :key="revision.id" class="revision">
+              <div class="record-head">
+                <p class="record-title">
+                  {{ recordOf(revision)?.fuel ?? "目标记录已删除" }}
+                  <span class="version-tag">
+                    基线 v{{ revision.baseVersion }} → 当前 v{{ recordOf(revision)?.version ?? "—" }}
+                  </span>
+                </p>
+                <span class="status" :class="{ conflict: conflictsOf(revision).length > 0 }">
+                  {{ recordOf(revision) ? (conflictsOf(revision).length ? "有冲突·需重新确认" : "待确认") : "无目标" }}
+                </span>
+              </div>
+              <p class="revision-meta">
+                {{ revision.submittedBy }} 提交于 {{ formatTime(revision.submittedAt) }}
+              </p>
+
+              <div class="change-list">
+                <div
+                  v-for="(change, key) in revision.changes"
+                  :key="key"
+                  class="change-row"
+                  :class="{ conflicted: conflictsOf(revision).includes(String(key)) }"
+                >
+                  <template v-if="conflictsOf(revision).includes(String(key))">
+                    <span class="change-label">{{ fieldLabel(String(key)) }}（两边都改过）</span>
+                    <div class="side-by-side">
+                      <label class="side" :class="{ picked: getChoice(revision.id, String(key)) === 'current' }">
+                        <input
+                          type="radio"
+                          :name="`${revision.id}-${String(key)}`"
+                          :checked="getChoice(revision.id, String(key)) === 'current'"
+                          @change="setChoice(revision.id, String(key), 'current')"
+                        />
+                        <em>当前生效值</em>
+                        <strong>{{ currentValue(revision, String(key)) }}</strong>
+                      </label>
+                      <label class="side" :class="{ picked: getChoice(revision.id, String(key)) === 'mine' }">
+                        <input
+                          type="radio"
+                          :name="`${revision.id}-${String(key)}`"
+                          :checked="getChoice(revision.id, String(key)) === 'mine'"
+                          @change="setChoice(revision.id, String(key), 'mine')"
+                        />
+                        <em>本次提交值</em>
+                        <strong>{{ change.to }}</strong>
+                      </label>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <span class="change-label">{{ fieldLabel(String(key)) }}</span>
+                    <span class="change-diff">{{ change.from }} → <strong>{{ change.to }}</strong></span>
+                  </template>
+                </div>
+              </div>
+
+              <div class="actions">
+                <button v-if="recordOf(revision)" type="button" @click="confirm(revision)">值班经理确认</button>
+                <button class="secondary" type="button" @click="store.rejectRevision(revision.id, confirmer)">驳回</button>
+              </div>
+            </article>
+          </div>
+
           <div class="toolbar">
             <h2>{{ project.entityLabel }}列表</h2>
             <select v-model="filter">
@@ -244,28 +280,39 @@ function remove(id: string) {
             <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
             <article v-for="record in filteredRecords" :key="record.id" class="record">
               <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
+                <p class="record-title">
+                  {{ primaryText(record) }}
+                  <span class="version-tag">v{{ record.version }}</span>
+                </p>
                 <span class="status">{{ record.status }}</span>
               </div>
               <div class="details">
                 <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
               </div>
               <p class="note">{{ record.notes }}</p>
+              <p class="revision-meta">更新于 {{ formatTime(record.updatedAt) }}</p>
               <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
+                <button type="button" @click="startEdit(record)">编辑</button>
+                <button class="secondary" type="button" @click="store.flowStatus(record.id)">流转状态</button>
+                <button class="secondary" type="button" @click="copySummary(record)">复制摘要</button>
+                <button class="danger" type="button" @click="store.removeRecord(record.id)">删除</button>
               </div>
             </article>
           </div>
 
           <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
+            <div v-for="row in store.chartRows" :key="row.status" class="bar">
               <span>{{ row.status }}</span>
               <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
               <strong>{{ row.value }}</strong>
             </div>
           </div>
+
+          <p class="snapshot-line">
+            有效价快照 {{ store.snapshotMeta ? `v${store.snapshotMeta.version}` : "未生成" }}
+            · {{ formatTime(store.snapshotMeta?.savedAt) }}
+            <template v-if="store.lastSyncAt"> · 最近同步 {{ formatTime(store.lastSyncAt) }}</template>
+          </p>
         </section>
       </section>
     </div>
